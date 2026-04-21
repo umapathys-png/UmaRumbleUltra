@@ -11,12 +11,12 @@ from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
-PROFIT_TARGET_PCT = 0.30  # Slightly higher to ensure profit after spread
+PROFIT_TARGET_PCT = 0.30  
 STOP_LOSS_PCT = -0.20     
 MAX_SLOTS = 5             
 TRADE_AMOUNT = 100        
 RSI_THRESHOLD = 30        
-MAX_ALLOWED_SPREAD = 0.08 # Do not buy if spread is wider than 0.08%
+MAX_ALLOWED_SPREAD = 0.08 
 
 API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
@@ -24,19 +24,61 @@ SECRET_KEY = os.getenv('SECRET_KEY')
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 crypto_data = CryptoHistoricalDataClient()
 
-async def get_market_health(symbol):
-    """Checks Spread and 5-minute Trend to ensure high-quality entries."""
+async def manage_existing_positions():
+    """Manages exits and logs the exact dollar investment and P/L."""
+    print("📋 --- Portfolio Status ---")
     try:
-        # 1. Check Spread (Hummingbot Logic)
+        positions = trading_client.get_all_positions()
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return 0
+    
+    if not positions:
+        print("ℹ️ No active investments.")
+        return 0
+
+    total_invested = 0
+    for pos in positions:
+        # Financial Data
+        symbol = pos.symbol
+        qty = float(pos.qty)
+        entry_price = float(pos.avg_entry_price)
+        current_price = float(pos.current_price)
+        
+        # Calculations
+        invested_amount = float(pos.cost_basis) # Total USD put into this trade
+        current_value = qty * current_price
+        pl_dollars = current_value - invested_amount
+        gain_pct = (pl_dollars / invested_amount) * 100
+        
+        total_invested += invested_amount
+        
+        print(f"🔎 {symbol}: Invested: ${invested_amount:.2f} | Current Value: ${current_value:.2f}")
+        print(f"   📈 P/L: ${pl_dollars:+.2f} ({gain_pct:.2f}%)")
+
+        # Exit Logic
+        if gain_pct >= PROFIT_TARGET_PCT and current_price > entry_price:
+            print(f"✅ CLOSING PROFIT: {symbol} at ${current_price} | Gain: ${pl_dollars:+.2f}")
+            trading_client.close_position(symbol)
+        elif gain_pct <= STOP_LOSS_PCT:
+            print(f"🛑 CLOSING LOSS: {symbol} at ${current_price} | Loss: ${pl_dollars:+.2f}")
+            trading_client.close_position(symbol)
+            
+    print(f"💰 Total Capital Currently Invested: ${total_invested:.2f}")
+    return len(positions)
+
+async def get_market_health(symbol):
+    """Checks Spread and Trend to protect the investment."""
+    try:
+        # Spread Check
         headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
         async with aiohttp.ClientSession() as session:
             url = f"https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols={symbol.replace('/', '')}"
             async with session.get(url, headers=headers) as resp:
-                q_data = await resp.json()
-                quote = q_data['quotes'][symbol.replace('/', '')]
-                spread = ((float(quote['ap']) - float(quote['bp'])) / float(quote['bp'])) * 100
+                q = (await resp.json())['quotes'][symbol.replace('/', '')]
+                spread = ((float(q['ap']) - float(q['bp'])) / float(q['bp'])) * 100
 
-        # 2. Check 5m Trend (EMA 20)
+        # Trend & RSI
         start_time = datetime.now() - timedelta(hours=5)
         req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start_time)
         bars = crypto_data.get_crypto_bars(req).df
@@ -44,70 +86,51 @@ async def get_market_health(symbol):
         bars['rsi'] = ta.rsi(bars['close'], length=14)
         
         curr = bars.iloc[-1]
-        is_uptrend = curr['close'] > curr['ema_20']
-        is_green_candle = curr['close'] > curr['open']
-
-        return {
-            "spread": spread,
-            "rsi": curr['rsi'],
-            "is_healthy": is_uptrend and is_green_candle,
-            "price": curr['close']
-        }
+        is_healthy = curr['close'] > curr['ema_20'] and curr['close'] > curr['open']
+        
+        return {"spread": spread, "rsi": curr['rsi'], "is_healthy": is_healthy}
     except:
         return None
 
-async def manage_existing_positions():
-    """Manages exits with strict price-floor protection."""
-    print("📋 Checking portfolio...")
-    positions = trading_client.get_all_positions()
-    for pos in positions:
-        entry = float(pos.avg_entry_price)
-        current = float(pos.current_price)
-        gain = ((current - entry) / entry) * 100
-        
-        # Protect against selling at a loss due to bad data/spread
-        if gain >= PROFIT_TARGET_PCT and current > entry:
-            print(f"💰 Selling {pos.symbol} at profit.")
-            trading_client.close_position(pos.symbol)
-        elif gain <= STOP_LOSS_PCT:
-            print(f"📉 Stop Loss triggered for {pos.symbol}.")
-            trading_client.close_position(pos.symbol)
-    return len(positions)
-
 async def seek_new_trades(open_slots):
-    """Finds new trades with Spread and Trend filters."""
+    """Finds new opportunities and logs the intended investment."""
     url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=50"
     headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
     
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
-            data = await resp.json()
-            movers = [s['symbol'] for s in data.get('gainers', []) if s['symbol'].endswith('/USD')]
+            movers = [s['symbol'] for s in (await resp.json()).get('gainers', []) if s['symbol'].endswith('/USD')]
 
     for symbol in movers:
         if open_slots <= 0: break
         
-        # Check if already owned
         try:
             trading_client.get_open_position(symbol.replace("/", ""))
             continue 
         except: pass
 
-        health = await get_market_health(symbol)
-        if health and health['spread'] <= MAX_ALLOWED_SPREAD:
-            if health['rsi'] < RSI_THRESHOLD and health['is_healthy']:
-                print(f"🚀 BUY SIGNAL: {symbol} | Spread: {health['spread']:.3f}%")
-                trading_client.submit_order(MarketOrderRequest(
-                    symbol=symbol, notional=TRADE_AMOUNT, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
-                ))
-                open_slots -= 1
-                await asyncio.sleep(2)
+        h = await get_market_health(symbol)
+        if h and h['spread'] <= MAX_ALLOWED_SPREAD and h['rsi'] < RSI_THRESHOLD and h['is_healthy']:
+            print(f"🚀 EXECUTING BUY: {symbol} | Amount: ${TRADE_AMOUNT} | Spread: {h['spread']:.3f}%")
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=symbol, notional=TRADE_AMOUNT, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
+            ))
+            open_slots -= 1
+            await asyncio.sleep(2)
 
 async def main():
-    print(f"--- ⚡ Cycle Started: {datetime.now().strftime('%H:%M:%S')} ---")
+    start_dt = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"\n--- ⚡ Cycle Start: {start_dt} ---")
+    
     active_count = await manage_existing_positions()
-    await seek_new_trades(MAX_SLOTS - active_count)
-    print("--- ✅ Cycle Complete ---")
+    
+    open_slots = MAX_SLOTS - active_count
+    if open_slots > 0:
+        await seek_new_trades(open_slots)
+    else:
+        print("🚫 Slots Full. Monitoring current investments only.")
+        
+    print(f"--- ✅ Cycle Complete ---\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
