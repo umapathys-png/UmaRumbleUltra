@@ -25,39 +25,38 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 crypto_data = CryptoHistoricalDataClient()
 
 async def get_secure_data(symbol):
-    """Reliability Pillar: Checks Data Freshness, Volatility, and RSI."""
     try:
-        start_time = datetime.now(timezone.utc) - timedelta(hours=6)
+        # Fetch longer history for 15m Trend + 1m RSI
+        start_time = datetime.now(timezone.utc) - timedelta(hours=24)
         req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start_time)
         bars = crypto_data.get_crypto_bars(req).df
         if bars.empty: return None
 
-        # 1. Freshness Check (Fix for image_82e17c.png)
-        last_candle_time = bars.index[-1][1].to_pydatetime()
-        latency = (datetime.now(timezone.utc) - last_candle_time).total_seconds()
-        if latency > DATA_FRESHNESS_LIMIT:
-            return None
-
-        # 2. Indicators
-        bars['rsi'] = ta.rsi(bars['close'], length=14)
-        bars['ema_20'] = ta.ema(bars['close'], length=20)
+        # 1. Macro Trend Check (15-Minute EMA)
+        # Resample 1m data to 15m to check the 'Big Trend'
+        bars_15m = bars.resample('15Min', level=1).last()
+        ema_15m = ta.ema(bars_15m['close'], length=200)
         
-        # 3. Volatility Check (ATR as % of price)
-        bars['atr'] = ta.atr(bars['high'], bars['low'], bars['close'], length=14)
-        curr = bars.iloc[-1]
-        volatility_score = (curr['atr'] / curr['close']) * 100
+        current_price = bars.iloc[-1]['close']
+        macro_trend_up = current_price > ema_15m.iloc[-1]
 
-        if volatility_score < MIN_VOLATILITY_SCORE:
-            # Coin is moving too slow to be profitable
-            return None
+        # 2. Micro Entry Check (1-Minute RSI)
+        rsi_1m = ta.rsi(bars['close'], length=14).iloc[-1]
+
+        # 3. Dynamic Volatility Sizing
+        atr = ta.atr(bars['high'], bars['low'], bars['close'], length=14).iloc[-1]
+        # We want to risk only 1% of our $1000 paper balance per trade
+        risk_amount = 10 
+        dynamic_qty = risk_amount / (atr * 2) # Stop loss usually at 2x ATR
 
         return {
-            "rsi": curr['rsi'],
-            "is_healthy": curr['close'] > curr['ema_20'] and curr['close'] > curr['open'],
-            "price": curr['close'],
-            "vol": volatility_score
+            "rsi": rsi_1m,
+            "is_healthy": rsi_1m < RSI_THRESHOLD and macro_trend_up,
+            "price": current_price,
+            "qty": dynamic_qty
         }
-    except:
+    except Exception as e:
+        print(f"Error analyzing {symbol}: {e}")
         return None
 
 async def manage_portfolio():
