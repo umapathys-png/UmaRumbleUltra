@@ -87,7 +87,7 @@ async def seek_new_trades(open_slots):
                 print("✅ All slots filled for this cycle.")
                 break
             
-            # Check if we already have this symbol to avoid double-dipping
+            # Check if we already have this symbol to avoid duplicates
             try:
                 trading_client.get_open_position(symbol.replace("/", ""))
                 continue 
@@ -104,13 +104,13 @@ async def seek_new_trades(open_slots):
                     open_slots -= 1
                     await asyncio.sleep(2) 
                 else:
-                    print(f"⏭️ Skipping {symbol}: RSI is {rsi:.2f} (Too high)")
+                    print(f"⏭️ Skipping {symbol}: RSI is {rsi:.2f} (Not oversold)")
                     
     except Exception as e:
         print(f"❌ Critical Search Error: {e}")
 
 async def main():
-    print(f"--- ⚡ Scalper Cycle Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+    print(f"--- ⚡ Think_Profit Cycle Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     
     try:
         # Step 1: Manage current portfolio
