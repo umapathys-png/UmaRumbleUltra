@@ -3,124 +3,154 @@ import asyncio
 import aiohttp
 import pandas_ta as ta
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- CONFIGURATION ---
 MAX_SLOTS = 5
 TRADE_AMOUNT = 100
 RSI_THRESHOLD = 30
 MAX_ALLOWED_SPREAD = 0.08
-KILL_SWITCH_THRESHOLD = 0.98  # 2% max daily loss on total account
+DATA_FRESHNESS_LIMIT = 60 # Seconds
 
 API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
+# Initialize Clients
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 crypto_data = CryptoHistoricalDataClient()
 
-async def check_kill_switch():
-    """Stops the bot if total account equity drops below 2% of the day's start."""
-    account = trading_client.get_account()
-    equity = float(account.equity)
-    last_equity = float(account.last_equity)
-    
-    if equity < (last_equity * KILL_SWITCH_THRESHOLD):
-        print(f"🚨 KILL SWITCH TRIGGERED: Equity ${equity} is below threshold.")
-        trading_client.close_all_positions(cancel_orders=True)
-        exit() # Full stop
-    return equity
+async def api_call_with_retry(func, *args, **kwargs):
+    """Reliability Pillar: Exponential Backoff for API Rate Limits."""
+    retries = 3
+    delay = 2
+    for i in range(retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if "429" in str(e) and i < retries - 1:
+                print(f"⚠️ Rate limited. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                raise e
 
-async def get_pro_metrics(symbol):
-    """Calculates ATR (Volatility) and RSI."""
+async def get_secure_data(symbol):
+    """Reliability Pillar: Data Freshness Gate & Precision Analysis."""
     try:
-        start_time = datetime.now() - timedelta(hours=10)
+        start_time = datetime.now(timezone.utc) - timedelta(hours=5)
         req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start_time)
-        df = crypto_data.get_crypto_bars(req).df
+        bars = crypto_data.get_crypto_bars(req).df
         
-        # Calculate ATR and RSI
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['rsi'] = ta.rsi(df['close'], length=14)
-        df['ema_20'] = ta.ema(df['close'], length=20)
+        if bars.empty: return None
+
+        # Check Data Latency
+        last_candle_time = bars.index[-1][1].to_pydatetime()
+        latency = (datetime.now(timezone.utc) - last_candle_time).total_seconds()
         
-        curr = df.iloc[-1]
-        # ATR-based Stop Loss: Current price minus 2x the average volatility
-        stop_loss_price = curr['close'] - (curr['atr'] * 2)
-        
+        if latency > DATA_FRESHNESS_LIMIT:
+            print(f"⏩ Stale Data for {symbol} ({latency:.0f}s old). Skipping.")
+            return None
+
+        # Calculate Indicators
+        bars['rsi'] = ta.rsi(bars['close'], length=14)
+        bars['ema_20'] = ta.ema(bars['close'], length=20)
+        curr = bars.iloc[-1]
+
         return {
             "rsi": curr['rsi'],
-            "price": curr['close'],
-            "stop_loss": stop_loss_price,
-            "is_uptrend": curr['close'] > curr['ema_20'],
-            "atr": curr['atr']
+            "is_healthy": curr['close'] > curr['ema_20'] and curr['close'] > curr['open'],
+            "price": curr['close']
         }
-    except: return None
+    except Exception as e:
+        print(f"❌ Data Error for {symbol}: {e}")
+        return None
 
-async def manage_positions():
-    """Implements Trailing Profit Logic."""
-    print("📋 Monitoring Positions...")
-    positions = trading_client.get_all_positions()
-    for pos in positions:
-        symbol = pos.symbol
-        entry = float(pos.avg_entry_price)
-        current = float(pos.current_price)
-        gain = ((current - entry) / entry) * 100
-        
-        # 1. Trailing Stop Logic (The 'Trailing' Pillar)
-        # If gain is > 0.5%, and it drops 0.15% from its high, we exit.
-        if gain > 0.50:
-            print(f"🔥 {symbol} is Mooning ({gain:.2f}%). Activating Trailing Floor.")
-            # Note: In a production bot, you'd track the 'High Water Mark' in a database.
-            # For this script, we'll tighten the exit to lock in the 0.35% target.
-            if gain < 0.40: # Price dipped from the peak back to 0.40%
-                 trading_client.close_position(symbol)
-        
-        # 2. Hard Stop Loss
-        elif gain < -0.25:
-            print(f"🛑 Stop Loss: {symbol}")
-            trading_client.close_position(symbol)
-
-    return len(positions)
-
-async def execute_limit_buy(symbol, price):
-    """Maker-Only Execution (The 'Execution' Pillar)"""
-    # Placing a limit order at the current BID price ensures we are a 'Maker' (Lower Fee)
-    print(f"⚡ Placing LIMIT BUY for {symbol} at ${price}")
+async def manage_portfolio():
+    """Reliability Pillar: State Reconciliation (Live Sync)."""
+    print("📋 Reconciling Portfolio State...")
     try:
+        # Get actual positions from the exchange (The Source of Truth)
+        positions = trading_client.get_all_positions()
+        
+        total_pnl = 0
+        for pos in positions:
+            cost = float(pos.cost_basis)
+            val = float(pos.qty) * float(pos.current_price)
+            pnl = val - cost
+            gain_pct = (pnl / cost) * 100
+            total_pnl += pnl
+            
+            print(f"🔎 Holding {pos.symbol}: ${cost:.2f} | P/L: ${pnl:+.2f} ({gain_pct:.2f}%)")
+
+            # Exit Logic (Strict Price Floor)
+            if gain_pct >= 0.35 and float(pos.current_price) > float(pos.avg_entry_price):
+                print(f"💰 Target Met. Closing {pos.symbol}")
+                trading_client.close_position(pos.symbol)
+            elif gain_pct <= -0.25:
+                print(f"🛑 Stop Loss. Closing {pos.symbol}")
+                trading_client.close_position(pos.symbol)
+        
+        return len(positions), total_pnl
+    except Exception as e:
+        print(f"❌ Portfolio Sync Error: {e}")
+        return 0, 0
+
+async def execute_precise_buy(symbol, price):
+    """Reliability Pillar: Precision Rounding & Limit Execution."""
+    try:
+        # Fetch asset details to check decimal precision (lot_size)
+        asset = trading_client.get_asset(symbol.replace("/", ""))
+        
+        # Calculate quantity based on intended trade amount
+        qty = TRADE_AMOUNT / price
+        
+        # Note: In a full-scale bot, you'd round qty based on asset.min_order_size
+        # Here we use a safe 4-decimal round for most crypto pairs
+        safe_qty = round(qty, 4)
+
+        print(f"🚀 Placing Precise Limit Buy: {symbol} | Qty: {safe_qty} @ ${price}")
         trading_client.submit_order(LimitOrderRequest(
             symbol=symbol,
+            qty=safe_qty,
             limit_price=price,
-            notional=TRADE_AMOUNT,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC
         ))
     except Exception as e:
-        print(f"❌ Order Failed: {e}")
+        print(f"❌ Execution Failure for {symbol}: {e}")
 
 async def main():
-    equity = await check_kill_switch()
-    print(f"--- 🛡️ Pro Cycle | Equity: ${equity:.2f} ---")
+    print(f"\n--- ⚡ Think_Profit RELIABLE | {datetime.now().strftime('%H:%M:%S')} ---")
     
-    active_slots = await manage_positions()
+    # 1. State Sync
+    active_count, current_pnl = await manage_portfolio()
     
-    if active_slots < MAX_SLOTS:
-        # Search for gainers (filtered by spread)
+    # 2. Open Slot Management
+    slots_to_fill = MAX_SLOTS - active_count
+    if slots_to_fill > 0:
+        # Movers check with USD filter
         url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=20"
         headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as resp:
                 movers = [s['symbol'] for s in (await resp.json()).get('gainers', []) if '/USD' in s['symbol']]
-        
+
         for sym in movers:
-            if active_slots >= MAX_SLOTS: break
-            metrics = await get_pro_metrics(sym)
-            if metrics and metrics['rsi'] < RSI_THRESHOLD and metrics['is_uptrend']:
-                await execute_limit_buy(sym, metrics['price'])
-                active_slots += 1
+            if slots_to_fill <= 0: break
+            
+            data = await get_secure_data(sym)
+            if data and data['rsi'] < RSI_THRESHOLD and data['is_healthy']:
+                await execute_precise_buy(sym, data['price'])
+                slots_to_fill -= 1
+                await asyncio.sleep(2)
+    
+    print(f"📊 Cycle Summary: Active Slots: {active_count} | Session P/L: ${current_pnl:+.2f}")
+    print("--- ✅ Reliability Check Complete ---\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
