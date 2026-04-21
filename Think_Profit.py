@@ -83,39 +83,42 @@ async def manage_portfolio():
         return 0, 0
 
 async def seek_new_trades(open_slots):
-    """Finds non-stablecoin movers with high volatility."""
     url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=25"
     headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
     
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             raw_data = await resp.json()
-            # BLACKLIST: USDT, USDC, DAI (Fix for automatic stablecoin buys)
-            movers = [
-                s['symbol'] for s in raw_data.get('gainers', []) 
-                if '/USD' in s['symbol'] 
-                and not any(x in s['symbol'] for x in ['USDT', 'USDC', 'DAI'])
-            ]
+            movers = [s['symbol'] for s in raw_data.get('gainers', []) if '/USD' in s['symbol']]
+
+    print(f"📡 Scanning {len(movers)} potential movers...")
 
     for sym in movers:
         if open_slots <= 0: break
-        
-        # Avoid double-buying
-        try:
-            trading_client.get_open_position(sym.replace("/", ""))
-            continue
-        except: pass
+        if any(x in sym for x in ['USDT', 'USDC', 'DAI']): continue # Skip stables
 
         data = await get_secure_data(sym)
-        if data and data['rsi'] < RSI_THRESHOLD and data['is_healthy']:
-            print(f"🚀 BUY: {sym} | RSI: {data['rsi']:.2f} | Volatility: {data['vol']:.2f}%")
-            qty = round(TRADE_AMOUNT / data['price'], 4)
-            trading_client.submit_order(LimitOrderRequest(
-                symbol=sym, qty=qty, limit_price=data['price'],
-                side=OrderSide.BUY, time_in_force=TimeInForce.GTC
-            ))
-            open_slots -= 1
-            await asyncio.sleep(2)
+        
+        if not data:
+            print(f"  ⏭️ {sym}: Skipping (Data stale or too slow)")
+            continue
+
+        # DEBUG LOGGING: This tells you exactly what the bot is seeing
+        if data['rsi'] >= RSI_THRESHOLD:
+            print(f"  ⏭️ {sym}: RSI too high ({data['rsi']:.1f} > {RSI_THRESHOLD})")
+            continue
+        
+        if not data['is_healthy']:
+            print(f"  ⏭️ {sym}: Not in an uptrend.")
+            continue
+
+        print(f"🚀 SIGNAL FOUND: {sym} | RSI: {data['rsi']:.1f} | Vol: {data['vol']:.2f}%")
+        qty = round(TRADE_AMOUNT / data['price'], 4)
+        trading_client.submit_order(LimitOrderRequest(
+            symbol=sym, qty=qty, limit_price=data['price'],
+            side=OrderSide.BUY, time_in_force=TimeInForce.GTC
+        ))
+        open_slots -= 1
 
 async def main():
     now = datetime.now().strftime('%H:%M:%S')
