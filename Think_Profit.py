@@ -125,7 +125,7 @@ async def main():
             if not res: continue
             
             # TRADE DECISION LOGIC
-            if res['rsi'] < RSI_THRESHOLD and res['is_uptrend']:
+            if res['rsi'] < RSI_THRESHOLD :
                 print(f"🎯 ENTRY SIGNAL: {res['symbol']} met all criteria!")
                 qty = round(min(MAX_TRADE_CAP / res['price'], BASE_TRADE_RISK / (res['atr'] * 2)), 4)
                 try:
