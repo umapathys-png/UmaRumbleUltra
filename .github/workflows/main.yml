@@ -1,25 +1,36 @@
 name: Crypto Scalper 24/7
-on:
-  schedule:
-    - cron: '*/30 * * * *' 
-  workflow_dispatch:
 
-concurrency:
-  group: trading-bot
-  cancel-in-progress: false
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '*/30 * * * *' # Runs every 30 minutes
 
 jobs:
   trade:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install alpaca-py pandas-ta aiohttp
       - name: Install Dependencies
         run: pip install alpaca-py pandas-ta aiohttp pytz requests
+
       - name: Run Scalper Cycle
         env:
-          API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          API_KEY: ${{ secrets.API_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
         run: python Think_Profit.py
+
+      - name: Save Trade Log for Excel
+        if: always() # Runs even if the python script fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-data-history
+          path: trade_log.csv
