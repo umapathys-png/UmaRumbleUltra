@@ -22,7 +22,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install alpaca-py aiohttp pandas numpy numba tqdm
           pip install pandas-ta --no-dependencies
-
+          pip install alpaca-py aiohttp pandas numpy numba tqdm pytz
+          
       - name: Run Scalper Cycle
         env:
           API_KEY: ${{ secrets.API_KEY }}
