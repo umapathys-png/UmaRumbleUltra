@@ -10,13 +10,13 @@ from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta, timezone
 
-# --- CONFIGURATION ---
+# --- UPDATED AGGRESSIVE CONFIG ---
 MAX_SLOTS = 5
 TRADE_AMOUNT = 100
-RSI_THRESHOLD = 30
-MAX_ALLOWED_SPREAD = 0.10   # 0.10% max spread
-DATA_FRESHNESS_LIMIT = 900  # 15 mins (Required for Alpaca Free Tier)
-MIN_VOLATILITY_SCORE = 0.5  # Coin must have an ATR/Price ratio of at least 0.5%
+RSI_THRESHOLD = 38           # More frequent entries
+MAX_ALLOWED_SPREAD = 0.12    # Slightly more tolerant of spreads
+DATA_FRESHNESS_LIMIT = 900   
+MIN_VOLATILITY_SCORE = 0.25  # Lowered to capture more movers
 
 API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
