@@ -24,15 +24,18 @@ LOG_FILE = 'trade_log.csv'
 API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
+# Initialize Clients
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 crypto_data = CryptoHistoricalDataClient()
 
 def log_to_excel(symbol, status, rsi=0, vol=0, price=0, gain=0):
+    """Appends trade events to a CSV for Excel analysis."""
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, mode='a', newline='') as file:
         writer = csv.writer(file)
         if not file_exists:
             writer.writerow(['Timestamp', 'Symbol', 'Status', 'RSI', 'Vol %', 'Price', 'P/L %'])
+        
         writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             symbol, status, round(rsi, 2), round(vol, 2), 
