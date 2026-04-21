@@ -14,7 +14,7 @@ from alpaca.data.timeframe import TimeFrame
 # --- CONFIGURATION ---
 MAX_SLOTS = 5
 BASE_TRADE_RISK = 10        
-MAX_TRADE_CAP = 150         
+MAX_TRADE_CAP = 500         
 RSI_THRESHOLD = 50          # Market Check threshold
 DATA_FRESHNESS_LIMIT = 1200 # Increased to 20 mins for better reliability
 MIN_VOLATILITY_SCORE = 0.3  
