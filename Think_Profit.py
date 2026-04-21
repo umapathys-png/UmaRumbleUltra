@@ -11,11 +11,11 @@ from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
-PROFIT_TARGET_PCT = 0.25  
-STOP_LOSS_PCT = -0.15     
-MAX_SLOTS = 5            
-TRADE_AMOUNT = 100        
-RSI_THRESHOLD = 35        
+PROFIT_TARGET_PCT = 0.25  # Target 0.25% gain
+STOP_LOSS_PCT = -0.15     # Exit if price drops 0.15%
+MAX_SLOTS = 5             # Maximum concurrent trades
+TRADE_AMOUNT = 100        # USD amount per trade
+RSI_THRESHOLD = 35        # Oversold entry point
 
 API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
@@ -24,30 +24,17 @@ SECRET_KEY = os.getenv('SECRET_KEY')
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 crypto_data = CryptoHistoricalDataClient()
 
-async def get_rsi(symbol):
-    """Fetches data and calculates RSI."""
-    try:
-        start_time = datetime.now() - timedelta(hours=3)
-        req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start_time)
-        bars = crypto_data.get_crypto_bars(req).df
-        if bars.empty: 
-            print(f"⚠️ No data found for {symbol}")
-            return None
-        
-        bars['rsi'] = ta.rsi(bars['close'], length=14)
-        current_rsi = bars['rsi'].iloc[-1]
-        return current_rsi
-    except Exception as e:
-        print(f"❌ Error calculating RSI for {symbol}: {e}")
-        return None
-
 async def manage_existing_positions():
-    """Checks current holdings and decides to SELL or HOLD."""
+    """Checks holdings and executes Take-Profit or Stop-Loss with Price Protection."""
     print("📋 Checking existing portfolio...")
-    positions = trading_client.get_all_positions()
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as e:
+        print(f"❌ Error fetching positions: {e}")
+        return 0
     
     if not positions:
-        print("ℹ️ No active positions to manage.")
+        print("ℹ️ No active positions.")
         return 0
 
     for pos in positions:
@@ -56,22 +43,57 @@ async def manage_existing_positions():
         current_price = float(pos.current_price)
         gain = ((current_price - entry_price) / entry_price) * 100
         
-        print(f"🔎 Monitoring {symbol}: Entry: ${entry_price:.4f} | Current: ${current_price:.4f} | Gain: {gain:.2f}%")
+        print(f"🔎 {symbol} | Entry: ${entry_price:.4f} | Current: ${current_price:.4f} | Gain: {gain:.2f}%")
         
-        if gain >= PROFIT_TARGET_PCT:
+        # LOGIC: Only sell for profit if gain target is met AND price is physically higher than entry
+        if gain >= PROFIT_TARGET_PCT and current_price > entry_price:
             print(f"💰 PROFIT TARGET MET: Selling {symbol} (+{gain:.2f}%)")
             trading_client.close_position(symbol)
         elif gain <= STOP_LOSS_PCT:
             print(f"📉 STOP LOSS HIT: Selling {symbol} ({gain:.2f}%)")
             trading_client.close_position(symbol)
         else:
-            print(f"⏳ Holding {symbol}: Waiting for target...")
+            print(f"⏳ {symbol}: Holding for target.")
             
     return len(positions)
 
+async def get_candle_analysis(symbol):
+    """OHLC Candle Logic: Analyzes trend and RSI for better entry timing."""
+    try:
+        start_time = datetime.now() - timedelta(hours=3)
+        req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start_time)
+        bars = crypto_data.get_crypto_bars(req).df
+        if len(bars) < 2: return None
+        
+        # RSI Calculation
+        bars['rsi'] = ta.rsi(bars['close'], length=14)
+        current_rsi = bars['rsi'].iloc[-1]
+        
+        # Candle Data
+        curr = bars.iloc[-1]
+        prev = bars.iloc[-2]
+        
+        # BULLISH CANDLE LOGIC
+        is_green = curr['close'] > curr['open']
+        is_engulfing = (curr['close'] - curr['open']) > (prev['open'] - prev['close'])
+        
+        # Bounce Logic
+        recent_low = bars['low'].rolling(window=15).min().iloc[-1]
+        has_bounced = curr['close'] > (recent_low * 1.001)
+
+        return {
+            "rsi": current_rsi,
+            "is_bullish": is_green and (is_engulfing or has_bounced),
+            "price": curr['close'],
+            "dip": recent_low
+        }
+    except Exception as e:
+        print(f"❌ Analysis Error for {symbol}: {e}")
+        return None
+
 async def seek_new_trades(open_slots):
-    """Scans for new RSI dip opportunities using ONLY USD pairs."""
-    print(f"🔍 Searching for {open_slots} new opportunities...")
+    """Scans movers and buys only when Candle Logic confirms the bounce."""
+    print(f"🔍 Searching for {open_slots} opportunities with Candle Logic...")
     
     headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
     url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=50"
@@ -80,58 +102,49 @@ async def seek_new_trades(open_slots):
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as resp:
                 data = await resp.json()
-                # FILTER: Only include symbols ending in /USD to match your cash balance
-                movers = [
-                    item['symbol'] for item in data.get('gainers', []) + data.get('losers', [])
-                    if item['symbol'].endswith('/USD')
-                ]
-                
-        for symbol in movers:
-            if open_slots <= 0: 
-                print("✅ All slots filled for this cycle.")
-                break
-            
-            # (Rest of the loop remains the same...)
-            
-            # Check if we already have this symbol to avoid duplicates
-            try:
-                trading_client.get_open_position(symbol.replace("/", ""))
-                continue 
-            except:
-                pass
+                # Filter for USD pairs to avoid balance errors
+                movers = [s['symbol'] for s in data.get('gainers', []) + data.get('losers', []) 
+                          if s['symbol'].endswith('/USD')]
 
-            rsi = await get_rsi(symbol)
-            if rsi is not None:
-                if rsi < RSI_THRESHOLD:
-                    print(f"🚀 RSI TRIGGER: Buying ${TRADE_AMOUNT} of {symbol} (RSI: {rsi:.2f})")
+        for symbol in movers:
+            if open_slots <= 0: break
+            
+            clean_symbol = symbol.replace("/", "")
+            try:
+                trading_client.get_open_position(clean_symbol)
+                continue 
+            except: pass
+
+            analysis = await get_candle_analysis(symbol)
+            
+            if analysis and analysis['rsi'] < RSI_THRESHOLD:
+                if analysis['is_bullish']:
+                    print(f"🔥 ENTRY SIGNAL: {symbol} | RSI: {analysis['rsi']:.2f} | Price: {analysis['price']}")
                     trading_client.submit_order(MarketOrderRequest(
                         symbol=symbol, notional=TRADE_AMOUNT, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
                     ))
                     open_slots -= 1
-                    await asyncio.sleep(2) 
+                    await asyncio.sleep(2) # Prevent API hammering
                 else:
-                    print(f"⏭️ Skipping {symbol}: RSI is {rsi:.2f} (Not oversold)")
-                    
+                    print(f"⏳ Watching {symbol}: RSI {analysis['rsi']:.2f} is low, but candle is weak.")
     except Exception as e:
-        print(f"❌ Critical Search Error: {e}")
+        print(f"❌ Search Error: {e}")
 
 async def main():
     print(f"--- ⚡ Think_Profit Cycle Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
-    
     try:
-        # Step 1: Manage current portfolio
-        current_pos_count = await manage_existing_positions()
+        # Step 1: Manage current holdings
+        active_count = await manage_existing_positions()
         
-        # Step 2: Look for new entries if slots are available
-        open_slots = MAX_SLOTS - current_pos_count
+        # Step 2: Fill empty slots
+        open_slots = MAX_SLOTS - active_count
         if open_slots > 0:
             await seek_new_trades(open_slots)
         else:
-            print("🚫 Maximum slot capacity reached (5/5). No new trades this cycle.")
+            print("🚫 Maximum slot capacity (5/5) reached.")
             
     except Exception as e:
-        print(f"❌ Main Loop Error: {e}")
-
+        print(f"❌ System Error: {e}")
     print(f"--- ✅ Cycle Complete ---")
 
 if __name__ == "__main__":
