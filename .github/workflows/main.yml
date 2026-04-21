@@ -20,7 +20,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install alpaca-py aiohttp pandas numpy numba
+          pip install alpaca-py aiohttp pandas numpy numba tqdm
           pip install pandas-ta --no-dependencies
 
       - name: Run Scalper Cycle
