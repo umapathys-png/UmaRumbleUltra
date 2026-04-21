@@ -70,22 +70,28 @@ async def manage_existing_positions():
     return len(positions)
 
 async def seek_new_trades(open_slots):
-    """Scans for new RSI dip opportunities."""
+    """Scans for new RSI dip opportunities using ONLY USD pairs."""
     print(f"🔍 Searching for {open_slots} new opportunities...")
     
     headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
-    url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=20"
+    url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=50"
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as resp:
                 data = await resp.json()
-                movers = [item['symbol'] for item in data.get('gainers', []) + data.get('losers', [])]
+                # FILTER: Only include symbols ending in /USD to match your cash balance
+                movers = [
+                    item['symbol'] for item in data.get('gainers', []) + data.get('losers', [])
+                    if item['symbol'].endswith('/USD')
+                ]
                 
         for symbol in movers:
             if open_slots <= 0: 
                 print("✅ All slots filled for this cycle.")
                 break
+            
+            # (Rest of the loop remains the same...)
             
             # Check if we already have this symbol to avoid duplicates
             try:
