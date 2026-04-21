@@ -3,7 +3,8 @@ name: Crypto Scalper 24/7
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'
+    # Running at minute 0 and 30 of every hour
+    - cron: '5,35 * * * *' 
 
 jobs:
   trade:
@@ -26,8 +27,8 @@ jobs:
 
       - name: Run Scalper Cycle
         env:
-          API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          API_KEY: ${{ secrets.API_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
         run: python Think_Profit.py
 
       - name: Save Trade Log for Excel
