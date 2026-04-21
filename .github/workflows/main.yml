@@ -1,9 +1,9 @@
 name: Crypto Scalper 24/7
 
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *' # Runs every 30 minutes
+    - cron: '*/30 * * * *'
 
 jobs:
   trade:
@@ -15,14 +15,13 @@ jobs:
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12' # Updated to satisfy alpaca-py requirements
+          python-version: '3.12'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install alpaca-py aiohttp
-          pip install pandas-ta --no-dependencies 
-          pip install pandas numpy # Ensure core dependencies for pandas-ta are present
+          pip install alpaca-py aiohttp pandas numpy numba
+          pip install pandas-ta --no-dependencies
 
       - name: Run Scalper Cycle
         env:
