@@ -1,10 +1,7 @@
 name: Crypto Scalper 24/7
 
 on:
-  workflow_dispatch:
-  schedule:
-    # Running at minute 0 and 30 of every hour
-    - cron: '5,35 * * * *' 
+  workflow_dispatch: # This stays so the external service can trigger it
 
 jobs:
   trade:
