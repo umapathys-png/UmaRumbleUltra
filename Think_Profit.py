@@ -2,134 +2,162 @@ import os
 import asyncio
 import aiohttp
 import pandas_ta as ta
+from datetime import datetime, timedelta, timezone
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from datetime import datetime, timedelta, timezone
 
-# --- UPDATED AGGRESSIVE CONFIG ---
+# --- CONFIGURATION ---
 MAX_SLOTS = 5
-TRADE_AMOUNT = 100
-RSI_THRESHOLD = 38           # More frequent entries
-MAX_ALLOWED_SPREAD = 0.12    # Slightly more tolerant of spreads
-DATA_FRESHNESS_LIMIT = 900   
-MIN_VOLATILITY_SCORE = 0.25  # Lowered to capture more movers
+BASE_TRADE_RISK = 10        # Risk $10 per trade based on volatility (not total $100)
+MAX_TRADE_CAP = 150         # Never spend more than $150 on a single position
+RSI_THRESHOLD = 35          # Aggressive entry
+DATA_FRESHNESS_LIMIT = 900  # 15 mins for Alpaca Free Tier
+MIN_VOLATILITY_SCORE = 0.3  # ATR/Price %
+KILL_SWITCH_LOSS_PCT = 0.02 # 2% Max Daily Drawdown
 
+# API CREDENTIALS
 API_KEY = os.getenv('API_KEY')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
+# Initialize Clients
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 crypto_data = CryptoHistoricalDataClient()
 
-async def get_secure_data(symbol):
+# --- SAFETY & UTILITY FUNCTIONS ---
+
+async def safety_circuit_breaker():
+    """Stops the bot if total account equity drops below threshold."""
     try:
-        # Fetch longer history for 15m Trend + 1m RSI
-        start_time = datetime.now(timezone.utc) - timedelta(hours=24)
-        req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start_time)
-        bars = crypto_data.get_crypto_bars(req).df
-        if bars.empty: return None
-
-        # 1. Macro Trend Check (15-Minute EMA)
-        # Resample 1m data to 15m to check the 'Big Trend'
-        bars_15m = bars.resample('15Min', level=1).last()
-        ema_15m = ta.ema(bars_15m['close'], length=200)
+        account = trading_client.get_account()
+        curr_equity = float(account.equity)
+        last_equity = float(account.last_equity)
         
-        current_price = bars.iloc[-1]['close']
-        macro_trend_up = current_price > ema_15m.iloc[-1]
+        if curr_equity < (last_equity * (1 - KILL_SWITCH_LOSS_PCT)):
+            print(f"🚨 KILL SWITCH: Loss > {KILL_SWITCH_LOSS_PCT*100}%. Liquidating...")
+            trading_client.close_all_positions(cancel_orders=True)
+            raise SystemError("CRITICAL: Daily Drawdown Limit Hit.")
+        print(f"🛡️ Safety Check: Account Healthy (${curr_equity:.2f})")
+    except Exception as e:
+        print(f"⚠️ Circuit Breaker Error: {e}")
 
-        # 2. Micro Entry Check (1-Minute RSI)
-        rsi_1m = ta.rsi(bars['close'], length=14).iloc[-1]
+async def get_secure_metrics(symbol):
+    """Calculates RSI, ATR, and Trend with Freshness Gate."""
+    try:
+        # Fetch 1m data (for RSI/ATR) and 15m (for Trend)
+        start = datetime.now(timezone.utc) - timedelta(hours=10)
+        req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start)
+        df = crypto_data.get_crypto_bars(req).df
+        if df.empty: return None
 
-        # 3. Dynamic Volatility Sizing
-        atr = ta.atr(bars['high'], bars['low'], bars['close'], length=14).iloc[-1]
-        # We want to risk only 1% of our $1000 paper balance per trade
-        risk_amount = 10 
-        dynamic_qty = risk_amount / (atr * 2) # Stop loss usually at 2x ATR
+        # Freshness Check
+        last_time = df.index[-1][1].to_pydatetime()
+        if (datetime.now(timezone.utc) - last_time).total_seconds() > DATA_FRESHNESS_LIMIT:
+            return None
+
+        # Indicators
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['ema_trend'] = ta.ema(df['close'], length=200) # Macro trend
+
+        curr = df.iloc[-1]
+        vol_score = (curr['atr'] / curr['close']) * 100
 
         return {
-            "rsi": rsi_1m,
-            "is_healthy": rsi_1m < RSI_THRESHOLD and macro_trend_up,
-            "price": current_price,
-            "qty": dynamic_qty
+            "symbol": symbol,
+            "rsi": curr['rsi'],
+            "price": curr['close'],
+            "vol": vol_score,
+            "is_uptrend": curr['close'] > curr['ema_trend'],
+            "atr": curr['atr']
         }
-    except Exception as e:
-        print(f"Error analyzing {symbol}: {e}")
-        return None
+    except: return None
 
 async def manage_portfolio():
-    """State Reconciliation: Syncs with Alpaca's live reality."""
+    """Reconciles live positions and manages exits."""
     try:
         positions = trading_client.get_all_positions()
-        total_pnl = 0
         for pos in positions:
-            cost = float(pos.cost_basis)
-            val = float(pos.qty) * float(pos.current_price)
-            pnl = val - cost
-            gain_pct = (pnl / cost) * 100
-            total_pnl += pnl
+            symbol = pos.symbol
+            entry = float(pos.avg_entry_price)
+            curr = float(pos.current_price)
+            gain = ((curr - entry) / entry) * 100
             
-            # Profit/Loss Exit Logic
-            if gain_pct >= 0.50 and float(pos.current_price) > float(pos.avg_entry_price):
-                trading_client.close_position(pos.symbol)
-            elif gain_pct <= -0.30:
-                trading_client.close_position(pos.symbol)
-        
-        return len(positions), total_pnl
-    except:
-        return 0, 0
+            # Scalping Exit Logic
+            if gain >= 0.60 or gain <= -0.40:
+                print(f"💰 Closing {symbol} at {gain:.2f}%")
+                trading_client.close_position(symbol)
+        return len(positions)
+    except: return 0
 
-async def seek_new_trades(open_slots):
-    url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=25"
+async def execute_trade(metrics):
+    """Calculates dynamic size and submits limit order."""
+    try:
+        # Dynamic Sizing: Risk $10 per 2x ATR movement
+        # If ATR is high (volatile), qty is low.
+        qty = BASE_TRADE_RISK / (metrics['atr'] * 2)
+        
+        # Cap the total dollar amount spent
+        if (qty * metrics['price']) > MAX_TRADE_CAP:
+            qty = MAX_TRADE_CAP / metrics['price']
+            
+        qty = round(qty, 4)
+        
+        print(f"🚀 Buying {metrics['symbol']} | RSI: {metrics['rsi']:.1f} | Qty: {qty}")
+        trading_client.submit_order(LimitOrderRequest(
+            symbol=metrics['symbol'],
+            qty=qty,
+            limit_price=metrics['price'],
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC
+        ))
+    except Exception as e:
+        print(f"❌ Trade Failed for {metrics['symbol']}: {e}")
+
+# --- MAIN LOOP ---
+
+async def main():
+    print(f"\n--- ⚡ Think_Profit APEX | {datetime.now().strftime('%H:%M:%S')} ---")
+    
+    # 1. Emergency Check
+    await safety_circuit_breaker()
+    
+    # 2. Sync Portfolio
+    active_slots = await manage_portfolio()
+    slots_available = MAX_SLOTS - active_slots
+    
+    if slots_available <= 0:
+        print("⏸️ Max slots filled. Monitoring...")
+        return
+
+    # 3. Parallel Scanning
+    url = "https://data.alpaca.markets/v1beta1/screener/crypto/movers?top=30"
     headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
     
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
-            raw_data = await resp.json()
-            movers = [s['symbol'] for s in raw_data.get('gainers', []) if '/USD' in s['symbol']]
+            raw = await resp.json()
+            candidates = [
+                s['symbol'] for s in raw.get('gainers', []) 
+                if '/USD' in s['symbol'] and not any(st in s['symbol'] for st in ['USDT', 'USDC', 'DAI'])
+            ]
 
-    print(f"📡 Scanning {len(movers)} potential movers...")
-
-    for sym in movers:
-        if open_slots <= 0: break
-        if any(x in sym for x in ['USDT', 'USDC', 'DAI']): continue # Skip stables
-
-        data = await get_secure_data(sym)
-        
-        if not data:
-            print(f"  ⏭️ {sym}: Skipping (Data stale or too slow)")
-            continue
-
-        # DEBUG LOGGING: This tells you exactly what the bot is seeing
-        if data['rsi'] >= RSI_THRESHOLD:
-            print(f"  ⏭️ {sym}: RSI too high ({data['rsi']:.1f} > {RSI_THRESHOLD})")
-            continue
-        
-        if not data['is_healthy']:
-            print(f"  ⏭️ {sym}: Not in an uptrend.")
-            continue
-
-        print(f"🚀 SIGNAL FOUND: {sym} | RSI: {data['rsi']:.1f} | Vol: {data['vol']:.2f}%")
-        qty = round(TRADE_AMOUNT / data['price'], 4)
-        trading_client.submit_order(LimitOrderRequest(
-            symbol=sym, qty=qty, limit_price=data['price'],
-            side=OrderSide.BUY, time_in_force=TimeInForce.GTC
-        ))
-        open_slots -= 1
-
-async def main():
-    now = datetime.now().strftime('%H:%M:%S')
-    print(f"\n--- ⚡ Think_Profit PRO | {now} ---")
+    # Scan top 15 candidates in parallel
+    tasks = [get_secure_metrics(sym) for sym in candidates[:15]]
+    results = await asyncio.gather(*tasks)
     
-    active_count, current_pnl = await manage_portfolio()
-    print(f"📊 Active Slots: {active_count} | Session P/L: ${current_pnl:+.2f}")
-    
-    if active_count < MAX_SLOTS:
-        await seek_new_trades(MAX_SLOTS - active_count)
-    
-    print("--- ✅ Cycle Complete ---\n")
+    for res in results:
+        if slots_available <= 0: break
+        if res and res['rsi'] < RSI_THRESHOLD and res['vol'] > MIN_VOLATILITY_SCORE:
+            if res['is_uptrend']:
+                await execute_trade(res)
+                slots_available -= 1
+                await asyncio.sleep(1)
+
+    print("--- ✅ Cycle Complete ---")
 
 if __name__ == "__main__":
     asyncio.run(main())
