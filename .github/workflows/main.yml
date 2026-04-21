@@ -1,0 +1,25 @@
+name: Crypto Scalper 24/7
+on:
+  schedule:
+    - cron: '*/30 * * * *' # Runs every 30 minutes
+  workflow_dispatch: # Allows you to run it manually for testing
+
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Dependencies
+        run: pip install alpaca-py pandas-ta aiohttp
+      - name: Run Scalper Cycle
+        env:
+          API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python Think_Profit.py
